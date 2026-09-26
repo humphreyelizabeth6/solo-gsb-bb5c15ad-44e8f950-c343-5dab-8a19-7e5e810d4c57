@@ -21,6 +21,22 @@ into subtitles that:
   first ends with sentence-ending punctuation or the gap between them is
   at least ``pause_threshold_ms``.  A boundary is "crossed" when it falls
   inside a subtitle rather than on its edge.
+* optional human-edited boundaries, both hard constraints:
+
+  - ``required_break_after``: word indices ``k`` (``0 <= k <= n-2``); a
+    subtitle edge *must* sit between word ``k`` and word ``k + 1``;
+  - ``keep_together``: closed word-index intervals ``[lo, hi]`` with at
+    least two words; no subtitle edge may fall strictly inside any of
+    them (the words may still be split between subtitles at the
+    interval's outside edges).
+
+  Intervals must be pairwise disjoint (they may touch at an endpoint,
+  e.g. ``[0, 1]`` and ``[2, 3]``), and no required break may fall inside
+  a keep-together interval.  Illegal or mutually conflicting inputs raise
+  a :class:`SegmentationError` (HTTP 422); the optimiser then searches
+  globally for the minimum-cost segmentation that satisfies both kinds of
+  edited boundaries alongside the other hard constraints, and if none
+  exists the caller gets an error.
 
   The *line-layout cost* of a subtitle is 0 when its text fits on one line;
   otherwise every legal two-line break is considered and the minimum of
@@ -54,6 +70,78 @@ class WordLike(Protocol):
 
 class SegmentationError(Exception):
     """Raised when the input cannot be segmented legally (mapped to HTTP 422)."""
+
+
+def _validate_manual_edits(
+    n: int,
+    required_break_after: Sequence[int] | None,
+    keep_together: Sequence[Sequence[int]] | None,
+) -> tuple[frozenset[int], tuple[tuple[int, int], ...]]:
+    """Validate human-edited boundaries for a transcript of ``n`` words.
+
+    Returns the required-break indices as a sorted, deduplicated set and
+    the keep-together ranges as sorted, pairwise-disjoint closed
+    intervals ``[lo, hi]``.  Raises :class:`SegmentationError` on any
+    illegal or mutually conflicting input.
+
+    * a required break index ``k`` must satisfy ``0 <= k <= n - 2`` (there
+      is no boundary after the last word);
+    * a keep-together range must contain at least two words, so
+      ``0 <= lo < hi <= n - 1``;
+    * keep-together ranges may touch at an endpoint but may not overlap;
+    * a required break may fall on a range's right outside edge (``hi``)
+      but not at its left outside edge (``lo``) nor strictly inside: a
+      break at ``lo`` would end word ``lo``'s subtitle while words
+      ``lo`` and ``lo + 1`` must stay together, which is contradictory.
+    """
+    required: set[int] = set()
+    for k in required_break_after or ():
+        if not 0 <= k <= n - 2:
+            raise SegmentationError(
+                f"required_break_after index {k} is out of range for {n} "
+                f"word(s); each must be between 0 and {n - 2}"
+            )
+        required.add(k)
+
+    ranges: list[tuple[int, int]] = []
+    for pair in keep_together or ():
+        lo, hi = pair
+        if not 0 <= lo <= n - 1 or not 0 <= hi <= n - 1:
+            raise SegmentationError(
+                f"keep_together interval [{lo}, {hi}] is out of range for "
+                f"{n} word(s); indices must be between 0 and {n - 1}"
+            )
+        if lo >= hi:
+            raise SegmentationError(
+                f"keep_together interval [{lo}, {hi}] must contain at least "
+                "two distinct words (lo < hi)"
+            )
+        ranges.append((lo, hi))
+
+    ranges.sort()
+    for (lo1, hi1), (lo2, hi2) in zip(ranges, ranges[1:]):
+        if lo2 <= hi1:
+            raise SegmentationError(
+                f"keep_together intervals [{lo1}, {hi1}] and [{lo2}, {hi2}] "
+                "overlap; intervals must be pairwise disjoint"
+            )
+
+    for lo, hi in ranges:
+        # A required break at ``lo`` (the interval's left outside edge) is
+        # also impossible: word ``lo`` would end the previous subtitle while
+        # staying in the same subtitle as word ``lo + 1``.  Breaks at the
+        # right outside edge ``hi`` are fine, as are breaks before ``lo``.
+        inside = [k for k in required if lo <= k < hi]
+        if inside:
+            k = inside[0]
+            where = "at the left edge of" if k == lo else "inside"
+            raise SegmentationError(
+                f"required_break_after index {k} falls {where} the "
+                f"keep_together interval [{lo}, {hi}]; a mandatory break "
+                "cannot be forbidden and required at the same boundary"
+            )
+
+    return frozenset(required), tuple(ranges)
 
 
 @dataclass
@@ -189,10 +277,32 @@ def segment_words(
     target_duration_ms: int,
     pause_threshold_ms: int,
     max_line_chars: int | None = None,
+    required_break_after: Sequence[int] | None = None,
+    keep_together: Sequence[Sequence[int]] | None = None,
 ) -> SegmentationResult:
     n = len(words)
     if n == 0:
         raise SegmentationError("words must contain at least one word")
+
+    # ---- human-edited boundary validation ---------------------------------
+    required_breaks, keep_ranges = _validate_manual_edits(
+        n, required_break_after, keep_together
+    )
+    # required_prefix[t] = number of required breaks on boundaries < t,
+    # i.e. among indices 0..t-1.  The breaks strictly inside a segment
+    # i..j are those with i <= k < j = required_prefix[j] - required_prefix[i].
+    required_prefix = [0] * (n + 1)
+    for t in range(1, n + 1):
+        required_prefix[t] = required_prefix[t - 1] + (
+            1 if t - 1 in required_breaks else 0
+        )
+    # blocked_edge[k] marks the boundary between words k-1 and k as a
+    # forbidden segment edge because it lies strictly inside a keep-together
+    # interval (its outside edges stay splittable).
+    blocked_edge = [False] * (n + 1)
+    for lo, hi in keep_ranges:
+        for k in range(lo + 1, hi + 1):
+            blocked_edge[k] = True
 
     # ---- input validation -------------------------------------------------
     for idx, w in enumerate(words):
@@ -273,6 +383,14 @@ def segment_words(
             dur_ms = words[j].end_ms - words[i].start_ms
             if dur_ms > max_duration_ms:
                 break  # only grows as j grows
+            # A mandatory break inside the segment is illegal, and once the
+            # span has swallowed one, every wider span starting at i does too.
+            if required_prefix[j] - required_prefix[i] > 0:
+                break
+            # The segment's end edge sits between words j and j+1; a
+            # keep-together interval forbids edges strictly inside itself.
+            if blocked_edge[j + 1]:
+                continue
             if max_line_chars is not None:
                 layout = _best_layout(i, j, cum_len, space_before, max_line_chars)
                 if layout is None:
@@ -303,13 +421,19 @@ def segment_words(
         layout_note = (
             f", max_line_chars={max_line_chars}" if max_line_chars is not None else ""
         )
+        manual_note = ""
+        if required_breaks or keep_ranges:
+            manual_note = (
+                " and the required_break_after / keep_together boundaries"
+            )
         raise SegmentationError(
             "no legal segmentation covers all words under the given constraints "
             f"(max_chars={max_chars}{layout_note}, min_duration_ms="
             f"{min_duration_ms}, max_duration_ms={max_duration_ms}); every "
             "subtitle — including the last one — must satisfy the duration "
             "limits (and, when set, fit on at most two lines of "
-            "max_line_chars), so try relaxing min_duration_ms or the other limits"
+            f"max_line_chars){manual_note}, so try relaxing min_duration_ms or "
+            "the other limits"
         )
 
     # ---- reconstruct the optimal path --------------------------------------

@@ -21,7 +21,9 @@ app = FastAPI(
         "max_line_chars is given it also includes a two-line typesetting cost "
         "(squared line-length difference divided by the squared line width; "
         "single-line subtitles cost 0). Ties are broken in favour of fewer "
-        "subtitles."
+        "subtitles. Optional required_break_after and keep_together fields "
+        "add hard, human-edited segment boundaries that the optimiser must "
+        "respect."
     ),
 )
 
@@ -61,6 +63,8 @@ def _run(req: SegmentRequest) -> SegmentationResult:
             target_duration_ms=req.target_duration_ms,
             pause_threshold_ms=req.pause_threshold_ms,
             max_line_chars=req.max_line_chars,
+            required_break_after=req.required_break_after,
+            keep_together=req.keep_together,
         )
     except SegmentationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

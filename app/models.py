@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+from typing import Annotated
+
 from pydantic import BaseModel, Field, model_validator
 
 from . import config
+
+# Non-negative word index (index-range checks against the actual word count
+# live in the segmenter, so both endpoints report them uniformly as 422).
+WordIndex = Annotated[int, Field(ge=0)]
 
 
 class Word(BaseModel):
@@ -58,6 +64,26 @@ class SegmentRequest(BaseModel):
             "between words, with every line no longer than this many "
             "characters (joining spaces included); omitted to keep plain "
             "single-line output"
+        ),
+    )
+    required_break_after: list[WordIndex] | None = Field(
+        default=None,
+        description=(
+            "optional zero-based word indices after which a subtitle break is "
+            "mandatory; each value k (0 <= k <= number of words - 2) forces a "
+            "segment edge between word k and word k+1. Duplicates are "
+            "ignored."
+        ),
+    )
+    keep_together: list[tuple[WordIndex, WordIndex]] | None = Field(
+        default=None,
+        description=(
+            "optional closed zero-based word-index intervals [lo, hi], each "
+            "containing at least two words (lo < hi), inside which no subtitle "
+            "edge may fall; intervals must be pairwise disjoint (touching at "
+            "an endpoint is allowed), and a required_break_after index may "
+            "not equal lo or lie inside [lo, hi] (it may equal hi, the "
+            "interval's right edge)"
         ),
     )
 

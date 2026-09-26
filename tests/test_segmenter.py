@@ -38,6 +38,16 @@ def _segment(texts: Sequence[str], dur_ms: int = 450, **kwargs):
     return segment_words(words, **opts)
 
 
+def assert_coverage(testcase: unittest.TestCase, result, n: int) -> None:
+    """Every word covered exactly once, in order; total cost sane."""
+    testcase.assertEqual(result.segments[0].word_start, 0)
+    testcase.assertEqual(result.segments[-1].word_end, n - 1)
+    for a, b in zip(result.segments, result.segments[1:]):
+        testcase.assertEqual(b.word_start, a.word_end + 1)
+    testcase.assertTrue(math.isfinite(result.total_cost))
+    testcase.assertGreaterEqual(result.total_cost, 0.0)
+
+
 class TestPunctuationAndJoining(unittest.TestCase):
     def test_sentence_endings(self):
         self.assertTrue(ends_with_sentence_punctuation("Hello."))
@@ -55,14 +65,7 @@ class TestPunctuationAndJoining(unittest.TestCase):
 
 class TestSegmentation(unittest.TestCase):
     def _check_coverage(self, result, n):
-        self.assertEqual(result.segments[0].word_start, 0)
-        self.assertEqual(result.segments[-1].word_end, n - 1)
-        for a, b in zip(result.segments, result.segments[1:]):
-            self.assertEqual(b.word_start, a.word_end + 1)
-        # total cost must equal the sum of per-segment costs advertised below
-        # (here we only assert it is a finite non-negative number)
-        self.assertTrue(math.isfinite(result.total_cost))
-        self.assertGreaterEqual(result.total_cost, 0.0)
+        assert_coverage(self, result, n)
 
     def test_covers_all_words_in_order_and_respects_max_chars(self):
         texts = ["a", "b", "c", "d", "e", "f"]
@@ -362,6 +365,209 @@ class TestLineLayout(unittest.TestCase):
         result = _segment(["aaa", "bbb", "ccc", "ddd"])
         for seg in result.segments:
             self.assertNotIn("\n", seg.text)
+
+
+class TestManualBoundaries(unittest.TestCase):
+    def test_required_break_forces_edge_even_when_costlier(self):
+        # 10 unpunctuated words of 200 ms; the duration optimum groups them
+        # in tens around the 2 s target. Forcing a break after word 0 makes
+        # word 0 a (costly) standalone subtitle it would never otherwise be.
+        texts = [f"w{i}" for i in range(10)]
+        forced = _segment(texts, dur_ms=200, required_break_after=[0])
+        ends = [s.word_end for s in forced.segments]
+        self.assertIn(0, ends)
+        self.assertEqual(forced.segments[0].word_end, 0)
+
+        plain = _segment(texts, dur_ms=200)
+        self.assertNotIn(0, [s.word_end for s in plain.segments])
+        # the constrained optimum is no cheaper than the free one
+        self.assertGreaterEqual(forced.total_cost, plain.total_cost - 1e-12)
+        # every word still covered once, in order
+        assert_coverage(self, forced, len(texts))
+
+    def test_multiple_required_breaks(self):
+        texts = [f"w{i}" for i in range(8)]
+        result = _segment(
+            texts, dur_ms=200, required_break_after=[1, 4], max_chars=100
+        )
+        ends = {s.word_end for s in result.segments}
+        self.assertIn(1, ends)
+        self.assertIn(4, ends)
+        assert_coverage(self, result, len(texts))
+
+    def test_duplicate_required_breaks_are_accepted(self):
+        result = _segment(
+            ["a", "b", "c"], dur_ms=500, required_break_after=[1, 1]
+        )
+        self.assertEqual(
+            [s.word_end for s in result.segments], [1, 2]
+        )
+
+    def test_keep_together_forbids_internal_edges(self):
+        # The free optimum breaks after words 2 and 5. Locking [2, 4] moves
+        # both edges away from the locked span.
+        texts = [f"w{i}" for i in range(6)]
+        result = _segment(texts, dur_ms=500, keep_together=[[2, 4]])
+        ends = [s.word_end for s in result.segments]
+        # neither boundary 2 nor 3 (strictly inside [2, 4]) may be an edge
+        self.assertNotIn(2, ends)
+        self.assertNotIn(3, ends)
+        # words 2, 3, 4 must all live in the same subtitle
+        spans = [(s.word_start, s.word_end) for s in result.segments]
+        self.assertTrue(any(a <= 2 and 4 <= b for a, b in spans))
+        assert_coverage(self, result, len(texts))
+
+    def test_keep_together_allows_its_right_outside_edge(self):
+        # [1, 2] locks only boundary 1; the edge after word 2 (the interval's
+        # right edge) stays available, and a required break there is legal.
+        result = _segment(
+            ["a", "b", "c", "d"],
+            dur_ms=500,
+            keep_together=[[1, 2]],
+            required_break_after=[2],
+        )
+        ends = [s.word_end for s in result.segments]
+        self.assertNotIn(1, ends)
+        self.assertIn(2, ends)
+
+    def test_combined_edits_are_respected_and_optimal(self):
+        texts = [f"w{i}" for i in range(6)]
+        result = _segment(
+            texts,
+            dur_ms=500,
+            required_break_after=[0],
+            keep_together=[[2, 3]],
+        )
+        ends = [s.word_end for s in result.segments]
+        self.assertIn(0, ends)
+        self.assertNotIn(2, ends)
+        spans = [(s.word_start, s.word_end) for s in result.segments]
+        self.assertTrue(any(a <= 2 and 3 <= b for a, b in spans))
+        assert_coverage(self, result, len(texts))
+
+    def test_touching_intervals_are_disjoint_and_allowed(self):
+        result = _segment(
+            ["a", "b", "c", "d"],
+            dur_ms=500,
+            keep_together=[[0, 1], [2, 3]],
+        )
+        assert_coverage(self, result, 4)
+
+    def test_required_break_index_after_last_word_raises(self):
+        with self.assertRaises(SegmentationError) as ctx:
+            _segment(["a", "b", "c"], required_break_after=[2])
+        self.assertIn("required_break_after", str(ctx.exception))
+        self.assertIn("0 and 1", str(ctx.exception))
+
+    def test_required_break_on_single_word_raises(self):
+        with self.assertRaises(SegmentationError) as ctx:
+            _segment(["a"], required_break_after=[0])
+        self.assertIn("required_break_after", str(ctx.exception))
+
+    def test_negative_required_break_index_raises(self):
+        with self.assertRaises(SegmentationError):
+            _segment(["a", "b"], required_break_after=[-1])
+
+    def test_keep_interval_must_contain_two_words(self):
+        with self.assertRaises(SegmentationError) as ctx:
+            _segment(["a", "b", "c"], keep_together=[[1, 1]])
+        self.assertIn("at least two distinct words", str(ctx.exception))
+
+    def test_keep_interval_out_of_range_raises(self):
+        with self.assertRaises(SegmentationError) as ctx:
+            _segment(["a", "b"], keep_together=[[0, 5]])
+        self.assertIn("out of range", str(ctx.exception))
+
+    def test_overlapping_keep_intervals_raise(self):
+        with self.assertRaises(SegmentationError) as ctx:
+            _segment(
+                ["a", "b", "c", "d", "e"],
+                keep_together=[[0, 2], [2, 4]],
+            )
+        self.assertIn("overlap", str(ctx.exception))
+
+    def test_required_break_inside_keep_interval_raises(self):
+        with self.assertRaises(SegmentationError) as ctx:
+            _segment(
+                ["a", "b", "c", "d"],
+                required_break_after=[2],
+                keep_together=[[1, 3]],
+            )
+        self.assertIn("required_break_after", str(ctx.exception))
+
+    def test_required_break_at_keep_left_edge_raises(self):
+        # Break after word 1 AND keep words 1..2 together is contradictory.
+        with self.assertRaises(SegmentationError) as ctx:
+            _segment(
+                ["a", "b", "c", "d"],
+                required_break_after=[1],
+                keep_together=[[1, 2]],
+            )
+        self.assertIn("required_break_after", str(ctx.exception))
+
+    def test_no_legal_solution_due_to_required_break_raises(self):
+        # The mandatory first subtitle (word 0, 500 ms) cannot reach the
+        # 1000 ms minimum duration.
+        with self.assertRaises(SegmentationError) as ctx:
+            _segment(
+                ["a", "b", "c"],
+                dur_ms=500,
+                required_break_after=[0],
+                min_duration_ms=1000,
+            )
+        msg = str(ctx.exception)
+        self.assertIn("no legal segmentation", msg)
+        self.assertIn("required_break_after", msg)
+
+    def test_no_legal_solution_due_to_keep_together_raises(self):
+        # Keeping the two 5-char words together exceeds max_chars=9.
+        words = [W("aaaaa", 0, 500), W("bbbbb", 500, 1000), W("c", 1000, 1500)]
+        with self.assertRaises(SegmentationError) as ctx:
+            segment_words(
+                words,
+                max_chars=9,
+                min_duration_ms=0,
+                max_duration_ms=100000,
+                target_duration_ms=1000,
+                pause_threshold_ms=1000,
+                keep_together=[[0, 1]],
+            )
+        self.assertIn("no legal segmentation", str(ctx.exception))
+
+    def test_edits_work_under_two_line_width(self):
+        words = [
+            W(t, i * 400, (i + 1) * 400)
+            for i, t in enumerate(
+                ["aaaa", "bbbb", "cccc", "dddd", "eeee", "ffff"]
+            )
+        ]
+        result = segment_words(
+            words,
+            max_chars=100,
+            min_duration_ms=0,
+            max_duration_ms=100000,
+            target_duration_ms=1200,
+            pause_threshold_ms=1000,
+            max_line_chars=9,
+            required_break_after=[1],
+            keep_together=[[3, 4]],
+        )
+        ends = [s.word_end for s in result.segments]
+        self.assertIn(1, ends)
+        self.assertNotIn(3, ends)
+        for seg in result.segments:
+            for line in seg.text.split("\n"):
+                self.assertLessEqual(len(line), 9)
+
+    def test_empty_edit_lists_equal_default(self):
+        texts = [f"w{i}" for i in range(6)]
+        plain = _segment(texts)
+        edited = _segment(texts, required_break_after=[], keep_together=[])
+        self.assertAlmostEqual(plain.total_cost, edited.total_cost, places=12)
+        self.assertEqual(
+            [s.word_end for s in plain.segments],
+            [s.word_end for s in edited.segments],
+        )
 
 
 class TestSRT(unittest.TestCase):
