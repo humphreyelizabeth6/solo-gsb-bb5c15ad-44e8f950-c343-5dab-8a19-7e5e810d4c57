@@ -17,6 +17,7 @@ from app.segmenter import (
     ends_with_sentence_punctuation,
     join_word_texts,
     segment_words,
+    validate_boundaries,
 )
 from app.srt import format_timestamp, to_srt
 
@@ -362,6 +363,200 @@ class TestLineLayout(unittest.TestCase):
         result = _segment(["aaa", "bbb", "ccc", "ddd"])
         for seg in result.segments:
             self.assertNotIn("\n", seg.text)
+
+
+class TestEditingBoundaries(unittest.TestCase):
+    def _edges(self, result):
+        return [s.word_end for s in result.segments[:-1]]
+
+    def _check_coverage(self, result, n):
+        self.assertEqual(result.segments[0].word_start, 0)
+        self.assertEqual(result.segments[-1].word_end, n - 1)
+        for a, b in zip(result.segments, result.segments[1:]):
+            self.assertEqual(b.word_start, a.word_end + 1)
+
+    # ---- required_break_after ---------------------------------------------
+    def test_required_break_after_forces_boundary(self):
+        texts = [f"w{i}" for i in range(8)]
+        # unconstrained optimum is two groups of four
+        base = _segment(texts)
+        self.assertEqual(self._edges(base), [3])
+        result = _segment(texts, required_break_after=[2])
+        self.assertIn(2, self._edges(result))
+        self._check_coverage(result, len(texts))
+
+    def test_required_break_after_may_be_redundant(self):
+        # asking for a break the optimiser already chooses must not change cost
+        texts = [f"w{i}" for i in range(8)]
+        base = _segment(texts)
+        result = _segment(texts, required_break_after=[3])
+        self.assertEqual(self._edges(result), self._edges(base))
+        self.assertAlmostEqual(result.total_cost, base.total_cost, places=9)
+
+    def test_multiple_required_breaks_all_present(self):
+        texts = [f"w{i}" for i in range(10)]
+        result = _segment(texts, required_break_after=[1, 4, 7])
+        edges = self._edges(result)
+        for k in (1, 4, 7):
+            self.assertIn(k, edges)
+        self._check_coverage(result, len(texts))
+
+    def test_required_break_after_index_out_of_range(self):
+        texts = [f"w{i}" for i in range(4)]
+        with self.assertRaises(SegmentationError) as ctx:
+            _segment(texts, required_break_after=[3])  # n-1 is illegal
+        self.assertIn("out of range", str(ctx.exception))
+        with self.assertRaises(SegmentationError):
+            _segment(texts, required_break_after=[-1])
+
+    def test_required_break_after_impossible_under_duration_limits(self):
+        # 450 ms words; a forced boundary after word 0 makes the first
+        # subtitle 450 ms long, below the 1000 ms minimum.
+        texts = [f"w{i}" for i in range(8)]
+        with self.assertRaises(SegmentationError) as ctx:
+            _segment(texts, required_break_after=[0], min_duration_ms=1000)
+        self.assertIn("no legal segmentation", str(ctx.exception))
+        self.assertIn("required_break_after", str(ctx.exception))
+
+    # ---- keep_together -----------------------------------------------------
+    def test_keep_together_forbids_inner_boundary(self):
+        texts = [f"w{i}" for i in range(8)]
+        # the unconstrained edge after word 3 would split [2, 5]
+        result = _segment(texts, keep_together=[[2, 5]])
+        edges = self._edges(result)
+        for k in (2, 3, 4):  # inner edges of [2, 5]
+            self.assertNotIn(k, edges)
+        self._check_coverage(result, len(texts))
+
+    def test_keep_together_interval_stays_in_one_subtitle(self):
+        texts = [f"w{i}" for i in range(6)]
+        result = _segment(texts, keep_together=[[2, 3]])
+        owner = None
+        for seg in result.segments:
+            if seg.word_start <= 2 <= seg.word_end:
+                owner = seg
+        self.assertIsNotNone(owner)
+        self.assertGreaterEqual(owner.word_end, 3)
+
+    def test_multiple_disjoint_intervals_kept_whole(self):
+        texts = [f"w{i}" for i in range(10)]
+        intervals = [[1, 2], [5, 7]]
+        result = _segment(texts, keep_together=intervals)
+        for a, b in intervals:
+            for seg in result.segments:
+                if seg.word_start <= a <= seg.word_end:
+                    self.assertGreaterEqual(seg.word_end, b)
+        self._check_coverage(result, len(texts))
+
+    def test_touching_intervals_are_allowed(self):
+        texts = [f"w{i}" for i in range(6)]
+        # touching end-to-start ([0,2] then [3,5]) is not a conflict; the
+        # edge between them is allowed but not required
+        result = _segment(texts, keep_together=[[0, 2], [3, 5]])
+        edges = self._edges(result)
+        self.assertNotIn(0, edges)
+        self.assertNotIn(1, edges)
+        self.assertNotIn(3, edges)
+        self.assertNotIn(4, edges)
+        self._check_coverage(result, len(texts))
+
+    def test_interval_must_span_at_least_two_words(self):
+        with self.assertRaises(SegmentationError) as ctx:
+            validate_boundaries(4, keep_together=[[2, 2]])
+        self.assertIn("at least two words", str(ctx.exception))
+
+    def test_interval_out_of_range(self):
+        with self.assertRaises(SegmentationError):
+            validate_boundaries(4, keep_together=[[2, 4]])
+        with self.assertRaises(SegmentationError):
+            validate_boundaries(4, keep_together=[[-1, 2]])
+
+    def test_overlapping_intervals_conflict(self):
+        with self.assertRaises(SegmentationError) as ctx:
+            validate_boundaries(8, keep_together=[[0, 3], [3, 5]])
+        self.assertIn("overlap", str(ctx.exception))
+        with self.assertRaises(SegmentationError):
+            validate_boundaries(8, keep_together=[[0, 5], [2, 3]])
+
+    def test_keep_together_impossible_under_char_limit(self):
+        texts = [f"word{i}" for i in range(4)]
+        with self.assertRaises(SegmentationError) as ctx:
+            _segment(texts, max_chars=8, keep_together=[[0, 3]])
+        self.assertIn("no legal segmentation", str(ctx.exception))
+        self.assertIn("keep_together", str(ctx.exception))
+
+    # ---- both kinds together ----------------------------------------------
+    def test_required_break_inside_interval_conflicts(self):
+        with self.assertRaises(SegmentationError) as ctx:
+            validate_boundaries(8, [3], [[2, 5]])
+        self.assertIn("falls inside keep_together", str(ctx.exception))
+
+    def test_break_on_interval_outer_edges_is_allowed(self):
+        # break after word 1 (just before [2,5]) and after word 5 (its end)
+        texts = [f"w{i}" for i in range(8)]
+        result = _segment(
+            texts,
+            required_break_after=[1, 5],
+            keep_together=[[2, 5]],
+        )
+        spans = [(s.word_start, s.word_end) for s in result.segments]
+        self.assertEqual(spans[0], (0, 1))
+        self.assertEqual(spans[1], (2, 5))
+        self.assertEqual(spans[2], (6, 7))
+
+    def test_combined_boundaries_still_global_optimum(self):
+        # forced edges must appear; the rest is chosen by minimum cost
+        texts = [f"w{i}" for i in range(12)]
+        result = _segment(
+            texts, required_break_after=[2], keep_together=[[6, 8]]
+        )
+        edges = self._edges(result)
+        self.assertIn(2, edges)
+        for k in (6, 7):
+            self.assertNotIn(k, edges)
+        self._check_coverage(result, len(texts))
+
+    def test_duplicate_required_breaks_and_intervals_are_idempotent(self):
+        texts = [f"w{i}" for i in range(6)]
+        r1 = _segment(
+            texts, required_break_after=[2, 2], keep_together=[[3, 4], [3, 4]]
+        )
+        r2 = _segment(texts, required_break_after=[2], keep_together=[[3, 4]])
+        self.assertEqual(
+            [(s.word_start, s.word_end) for s in r1.segments],
+            [(s.word_start, s.word_end) for s in r2.segments],
+        )
+
+    def test_boundaries_combine_with_line_layout(self):
+        words = [W(t, i * 450, (i + 1) * 450) for i, t in enumerate(
+            ["aaa", "bbb", "ccc", "ddd", "eee", "fff"]
+        )]
+        result = segment_words(
+            words,
+            max_chars=100,
+            min_duration_ms=0,
+            max_duration_ms=100000,
+            target_duration_ms=2000,
+            pause_threshold_ms=1000,
+            max_line_chars=7,
+            required_break_after=[1],
+            keep_together=[[3, 4]],
+        )
+        edges = [s.word_end for s in result.segments[:-1]]
+        self.assertIn(1, edges)
+        self.assertNotIn(3, edges)  # inner edge of [3, 4]
+        for seg in result.segments:
+            for line in seg.text.split("\n"):
+                self.assertLessEqual(len(line), 7)
+        self._check_coverage(result, 6)
+
+    def test_single_word_request_allows_empty_boundary_lists(self):
+        result = _segment(["only"], required_break_after=[], keep_together=[])
+        self.assertEqual(len(result.segments), 1)
+
+    def test_single_word_request_rejects_any_break(self):
+        with self.assertRaises(SegmentationError):
+            _segment(["only"], required_break_after=[0])
 
 
 class TestSRT(unittest.TestCase):

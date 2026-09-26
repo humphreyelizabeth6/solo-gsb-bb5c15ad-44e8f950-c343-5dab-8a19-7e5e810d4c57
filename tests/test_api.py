@@ -12,6 +12,7 @@ import unittest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.srt import format_timestamp as _ts
 
 
 def _word(text, start_ms, end_ms):
@@ -183,6 +184,141 @@ class TestAPI(unittest.TestCase):
         body = {**BODY, "max_line_chars": 0}
         r = self.client.post("/segment", json=body)
         self.assertEqual(r.status_code, 422)
+
+    # ---- manual editing boundaries ----------------------------------------
+    def test_required_break_after_forces_boundary(self):
+        body = {**BODY, "required_break_after": [4]}
+        r = self.client.post("/segment", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        segs = r.json()["segments"]
+        edges = [s["word_end"] for s in segs[:-1]]
+        self.assertIn(4, edges)
+        # every word still covered exactly once, in order
+        self.assertEqual(segs[0]["word_start"], 0)
+        self.assertEqual(segs[-1]["word_end"], len(BODY["words"]) - 1)
+        for a, b in zip(segs, segs[1:]):
+            self.assertEqual(b["word_start"], a["word_end"] + 1)
+
+    def test_keep_together_keeps_words_in_one_subtitle(self):
+        body = {**BODY, "keep_together": [[3, 5]]}
+        r = self.client.post("/segment", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        segs = r.json()["segments"]
+        edges = [s["word_end"] for s in segs[:-1]]
+        for inner in (3, 4):  # inner edges of [3, 5]
+            self.assertNotIn(inner, edges)
+        owner = next(s for s in segs if s["word_start"] <= 3 <= s["word_end"])
+        self.assertGreaterEqual(owner["word_end"], 5)
+
+    def test_boundaries_applied_identically_to_srt(self):
+        body = {
+            **BODY,
+            "min_duration_ms": 0,
+            "required_break_after": [4],
+            "keep_together": [[1, 2]],
+        }
+        rj = self.client.post("/segment", json=body)
+        rs = self.client.post("/segment/srt", json=body)
+        self.assertEqual(rj.status_code, 200, rj.text)
+        self.assertEqual(rs.status_code, 200, rs.text)
+        # both kinds of boundary are honoured ...
+        segs = rj.json()["segments"]
+        edges = [s["word_end"] for s in segs[:-1]]
+        self.assertIn(4, edges)
+        self.assertNotIn(1, edges)
+        # ... and the SRT blocks describe exactly the JSON segments
+        blocks = rs.text.strip().split("\n\n")
+        self.assertEqual(len(blocks), len(segs))
+        for n, block in enumerate(blocks, start=1):
+            lines = block.split("\n")
+            self.assertEqual(lines[0], str(n))
+            seg = segs[n - 1]
+            self.assertEqual(
+                lines[1],
+                f"{_ts(seg['start_ms'])} --> {_ts(seg['end_ms'])}",
+            )
+            self.assertEqual("\n".join(lines[2:]), seg["text"])
+
+    def test_boundaries_combine_with_two_line_layout(self):
+        words = [
+            _word("aaa", 0, 450),
+            _word("bbb", 450, 900),
+            _word("ccc", 900, 1350),
+            _word("ddd", 1350, 1800),
+        ]
+        body = {
+            "words": words,
+            "max_chars": 42,
+            "min_duration_ms": 0,
+            "max_duration_ms": 7000,
+            "target_duration_ms": 2000,
+            "pause_threshold_ms": 500,
+            "max_line_chars": 7,
+            "required_break_after": [1],
+        }
+        r = self.client.post("/segment", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        segs = r.json()["segments"]
+        self.assertEqual([s["word_end"] for s in segs[:-1]], [1])
+        for s in segs:
+            for line in s["text"].split("\n"):
+                self.assertLessEqual(len(line), 7)
+
+    def test_422_on_break_inside_keep_together(self):
+        body = {**BODY, "required_break_after": [4], "keep_together": [[3, 5]]}
+        r = self.client.post("/segment", json=body)
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("falls inside keep_together", r.json()["detail"])
+
+    def test_422_on_required_break_out_of_range(self):
+        body = {**BODY, "required_break_after": [len(BODY["words"]) - 1]}
+        r = self.client.post("/segment", json=body)
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("out of range", r.json()["detail"])
+
+    def test_422_on_required_break_negative(self):
+        body = {**BODY, "required_break_after": [-1]}
+        r = self.client.post("/segment", json=body)
+        self.assertEqual(r.status_code, 422)
+
+    def test_422_on_keep_together_too_short(self):
+        body = {**BODY, "keep_together": [[2, 2]]}
+        r = self.client.post("/segment", json=body)
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("at least two words", r.json()["detail"])
+
+    def test_422_on_overlapping_keep_together(self):
+        body = {**BODY, "keep_together": [[0, 3], [3, 5]]}
+        r = self.client.post("/segment", json=body)
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("overlap", r.json()["detail"])
+
+    def test_422_on_keep_together_out_of_range(self):
+        body = {**BODY, "keep_together": [[8, 9]]}
+        r = self.client.post("/segment", json=body)
+        self.assertEqual(r.status_code, 422)
+
+    def test_422_when_boundaries_make_segmentation_impossible(self):
+        # the forced first subtitle would contain only one 500 ms word,
+        # below the 1000 ms minimum duration
+        body = {**BODY, "required_break_after": [0]}
+        r = self.client.post("/segment", json=body)
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("no legal segmentation", r.json()["detail"])
+
+    def test_422_on_malformed_interval_shape(self):
+        body = {**BODY, "keep_together": [[1, 2, 3]]}
+        r = self.client.post("/segment", json=body)
+        self.assertEqual(r.status_code, 422)
+
+    def test_empty_boundary_lists_are_accepted(self):
+        body = {
+            **BODY,
+            "required_break_after": [],
+            "keep_together": [],
+        }
+        r = self.client.post("/segment", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
 
 
 if __name__ == "__main__":

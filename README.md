@@ -21,13 +21,21 @@
     的最小值，代价相同取**更靠前**的断点；不存在合法双行排版的候选字幕不可选；
   - **总代价平局时，选择字幕条数更少的方案。**
 
+- 人工编辑边界（可选，作为硬约束）：
+  - `required_break_after`：词下标数组，**必须**在每个指定词之后断开（下标按本次 `words` 的零基顺序计，只允许 `0 .. 词数-2`，即在最后一个词之后断没有意义）；
+  - `keep_together`：闭区间 `[start, end]` 数组，区间内部（词 `start` 之后直到词 `end-1` 之后的各条边）**不得**断开；每个区间至少含两个词（`0 <= start < end <= 词数-1`）；
+  - 两类边界不得互相冲突：必填断点不能落在某个不可断区间内部；两个不可断区间不能相互重叠（端点首尾相接，如 `[0,2]` 与 `[3,5]`，允许）；
+  - 切分器在原有全部硬约束下**全局**寻找同时满足两类边界的最低代价方案；满足边界本身不产生额外代价——它们只限制哪些断点可选；
+  - 非法或冲突的输入返回 `422`；边界合法但与时长 / 字数 / 行宽约束矛盾、不存在合法切分时同样返回 `422`。
+
 - 硬约束（违反则不存在合法切分，返回 `422`）：
   - 每条字幕字数 ≤ `max_chars`（沿用原有统计口径）；
   - 每条字幕时长 ∈ [`min_duration_ms`, `max_duration_ms`]（含最后一条）；
   - 传入 `max_line_chars` 时，每条字幕必须能排成不超过两行、每行不超过该行宽；
+  - 传入人工边界时，每条 `required_break_after` 必须是字幕边，任何 `keep_together` 区间必须完整落在同一条字幕内；
   - 全部词必须且只能出现一次，顺序不变。
 
-> 不传 `max_line_chars` 时，切分逻辑、代价与输出格式与旧版完全一致（始终单行）。
+> 不传 `max_line_chars`、`required_break_after`、`keep_together` 时，切分逻辑、代价与输出格式与旧版完全一致（始终单行、无人工边界）。
 
 ---
 
@@ -77,8 +85,10 @@ ports:
 | `target_duration_ms` | int | `3000` | 目标时长（毫秒），代价按秒计算 |
 | `pause_threshold_ms` | int | `500` | 词间间隔达到该值即视为长停顿边界 |
 | `max_line_chars` | int | 不传 | 可选正整数；双行排版行宽（≥ 1）。传入后每条字幕至多两行、仅在词间断行、每行（含词间空格）不超过该行宽；不传则保持单行旧行为 |
+| `required_break_after` | int 数组 | 不传（等同 `[]`） | 可选人工边界：必须在这些**词下标之后**断开。下标按本次 `words` 零基计，只允许 `0 .. len(words)-2`；不得落在 `keep_together` 区间内部 |
+| `keep_together` | `[start, end]` 数组 | 不传（等同 `[]`） | 可选人工边界：词下标**闭区间**，区间内部不得断开。每段至少两个词：`0 <= start < end <= len(words)-1`；区间两两不得重叠（首尾相接可以） |
 
-> 约束：`max_duration_ms >= min_duration_ms`、`max_line_chars >= 1`；参数省略时使用环境变量配置的默认值（`max_line_chars` 无环境变量默认值，省略即不启用双行排版）。
+> 约束：`max_duration_ms >= min_duration_ms`、`max_line_chars >= 1`；参数省略时使用环境变量配置的默认值（`max_line_chars`、`required_break_after`、`keep_together` 无环境变量默认值，省略即不启用）。人工边界下标均指**本次请求 `words` 的零基顺序**，与词的时间戳无关。
 
 请求示例：
 
@@ -157,6 +167,88 @@ curl -X POST http://localhost:8000/segment \
 - 中西文混排仍沿用原拼接规则：如 `你好 世界` 这类无空格相邻关系，断行处同样不补空格（例：`你好\n世界`）；
 - 原有 `max_chars` 与时长约束继续生效，任何候选没有合法双行排版时不可选，整体无合法切分返回 `422`。
 
+#### 人工编辑边界：`required_break_after` 与 `keep_together`
+
+两个字段都可省略（省略或传 `[]` 均表示不加人工约束），可同时使用；`/segment` 与 `/segment/srt` 共用同一份切分结果。下标一律按本次请求 `words` 的**零基顺序**：
+
+- `required_break_after`：列出“必须断开”的位置——在指定词**之后**就是一条字幕边。例如 `[6]` 表示词 6 与词 7 之间必须断开。合法取值为 `0 .. len(words)-2`（最后一个词之后是序列终点，本来就不是候选断点）；
+- `keep_together`：列出“不得断开”的词下标**闭区间**。例如 `[1, 2]` 表示词 1、2 必须落在同一条字幕里。每段至少两个词；
+- 两者不能冲突：必填断点落在不可断区间内部（区间的首尾外侧边可以）、两个区间重叠，都返回 `422`；
+- 约束只是“允许 / 禁止使用哪些断点”，不改变代价函数；优化器仍在剩余合法断点中全局找最低代价方案，因此原有平局规则（条数更少者胜）照旧。
+
+可用 `examples/request_manual_boundaries.json` 复现（9 个词；无人工约束时按目标时长 1.5 s 切成 4 条；加入 `required_break_after: [6]` 与 `keep_together: [[1, 2]]` 后得到 3 条）：
+
+```bash
+curl -X POST http://localhost:8000/segment \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_manual_boundaries.json
+```
+
+```json
+{
+  "segment_count": 3,
+  "total_cost": 5.39,
+  "segments": [
+    {
+      "index": 0,
+      "text": "Hello world. How",
+      "start_ms": 0,
+      "end_ms": 2400,
+      "duration_ms": 2400,
+      "word_start": 0,
+      "word_end": 2,
+      "crossed_boundaries": 0
+    },
+    {
+      "index": 1,
+      "text": "are you doing today?",
+      "start_ms": 2400,
+      "end_ms": 4600,
+      "duration_ms": 2200,
+      "word_start": 3,
+      "word_end": 6,
+      "crossed_boundaries": 0
+    },
+    {
+      "index": 2,
+      "text": "Fine thanks.",
+      "start_ms": 5200,
+      "end_ms": 6400,
+      "duration_ms": 1200,
+      "word_start": 7,
+      "word_end": 8,
+      "crossed_boundaries": 0
+    }
+  ]
+}
+```
+
+同一请求体发给 `/segment/srt` 即得到与上述三条逐字一致的 SRT（时间戳、文本、双行换行均相同）：
+
+```bash
+curl -X POST http://localhost:8000/segment/srt \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_manual_boundaries.json
+```
+
+非法输入示例（均为 `422`，`detail` 为一句原因说明）：
+
+```json
+{ "required_break_after": [4], "keep_together": [[3, 5]] }
+```
+```text
+required_break_after=4 falls inside keep_together interval [3, 5]; a break after word 4 would split words that must stay together
+```
+
+| 请求片段 | 422 原因 |
+| --- | --- |
+| `"required_break_after": [8]`（共 9 个词） | 下标越界（允许 `0..7`） |
+| `"required_break_after": [-1]` | 下标为负 |
+| `"keep_together": [[2, 2]]` | 区间少于两个词 |
+| `"keep_together": [[2, 8]]`（共 9 个词） | 端点越界 |
+| `"keep_together": [[0, 3], [3, 5]]` | 区间重叠（共用词 3） |
+| `"required_break_after": [0], "min_duration_ms": 1000`（首词仅 500 ms） | 边界合法但与时长约束矛盾，无合法切分 |
+
 ### `POST /segment/srt` —— SRT 导出
 
 请求体与 `/segment` 完全相同，返回 `text/plain; charset=utf-8` 的 SRT 文档：
@@ -213,10 +305,11 @@ ccc ddd
 - 某个词自身时长超过 `max_duration_ms`；
 - 词序列未按时间排序或存在重叠；
 - 参数本身不合法（空词、`end_ms <= start_ms`、`max_duration_ms < min_duration_ms`、`max_line_chars < 1` 等）；
-- 没有任何切分能满足全部约束（例如最后一个词短于 `min_duration_ms`，或传入 `max_line_chars` 后不存在满足行宽的双行排版）——会返回类似：
+- 人工编辑边界不合法或相互冲突：`required_break_after` 下标越界（不在 `0 .. len(words)-2`）、`keep_together` 区间端点越界 / 不足两个词、两个区间重叠、必填断点落在不可断区间内部；
+- 没有任何切分能满足全部约束（例如最后一个词短于 `min_duration_ms`，或传入 `max_line_chars` 后不存在满足行宽的双行排版，或人工边界与时长 / 字数 / 行宽约束矛盾）——会返回类似：
 
   ```json
-  {"detail": "no legal segmentation covers all words under the given constraints (max_chars=42, max_line_chars=20, min_duration_ms=1000, max_duration_ms=7000); every subtitle — including the last one — must satisfy the duration limits (and, when set, fit on at most two lines of max_line_chars), so try relaxing min_duration_ms or the other limits"}
+  {"detail": "no legal segmentation covers all words under the given constraints (max_chars=42, max_line_chars=20, min_duration_ms=1000, max_duration_ms=7000, required_break_after=[6], keep_together=[[1, 2]]); every subtitle — including the last one — must satisfy the duration limits (and, when set, fit on at most two lines of max_line_chars) while honouring required_break_after and keep_together, so try relaxing min_duration_ms or the other limits"}
   ```
 
 ---
@@ -233,7 +326,7 @@ ccc ddd
 | `DEFAULT_TARGET_DURATION_MS` | `3000` | `target_duration_ms` |
 | `DEFAULT_PAUSE_THRESHOLD_MS` | `500` | `pause_threshold_ms` |
 
-`max_line_chars` 没有环境变量默认值：省略该请求字段即不启用双行排版，行为与旧版完全一致。
+`max_line_chars`、`required_break_after`、`keep_together` 没有环境变量默认值：省略这些请求字段即不启用双行排版 / 人工边界，行为与旧版完全一致。
 
 不需要外部数据库或密钥，开箱即用。
 
@@ -268,7 +361,7 @@ app/
   srt.py         # SRT 时间戳与文档格式化
   main.py        # FastAPI 入口（/segment、/segment/srt、/health）
 tests/           # unittest 测试（核心逻辑 + API 集成）
-examples/        # 请求示例
+examples/        # 请求示例（基础、双行排版、人工编辑边界）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -286,5 +379,7 @@ dp[i] = 按 (总代价, 字幕条数) 字典序取最小，枚举合法的字幕
 ```
 
 字幕从 `i` 扩展到 `j` 时字数与时长单调增长，超限即可提前终止；自然边界计数用前缀和做 O(1) 区间查询。
+
+人工编辑边界在候选枚举阶段直接生效，仍是 O(n²)（双行排版时 O(n² log n)）：把每条词间边标记为“必选 / 禁止”——`required_break_after[k]` 使词 k 之后的边必选，候选字幕一旦跨过它即终止扩展；`keep_together [a,b]` 使区间内部的边（a..b-1 之后）禁止作为字幕边，从区间内部词开始的 DP 状态不可达，扩展中跨过内部边时必须把整条区间（直到词 b）都纳入当前字幕，且不能在区间内部收尾。这样 DP 只在“允许的断点集合”上取最优，必选边由其屏障作用自动保证被经过；`dp[0]` 不可达即说明人工边界与硬约束矛盾，返回 `422`。
 
 传入 `max_line_chars` 时，`linecost(i,j)` 为该候选字幕的排版代价：整段不超行宽则为 0（单行）；否则在词间枚举断点，两行各自不超行宽时计算 `(行长1 − 行长2)² / 行宽²`，取最小值（平局取靠前断点）；没有合法断点时该候选非法。行长用“词长 + 词间空格”的前缀和按二分搜索求值，合法断点范围与等长断点都只需 O(log n) 定位，因此整体时间复杂度仍为 O(n² log n)（不传该参数时为 O(n²)），空间 O(n)。

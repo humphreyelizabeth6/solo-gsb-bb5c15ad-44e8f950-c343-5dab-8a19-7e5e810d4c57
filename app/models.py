@@ -60,6 +60,25 @@ class SegmentRequest(BaseModel):
             "single-line output"
         ),
     )
+    required_break_after: list[int] | None = Field(
+        default=None,
+        description=(
+            "optional manual editing boundaries: zero-based indices into "
+            "this request's words after which a subtitle boundary must be "
+            "placed; each index must be between 0 and len(words)-2 and must "
+            "not fall inside a keep_together interval"
+        ),
+    )
+    keep_together: list[list[int]] | None = Field(
+        default=None,
+        description=(
+            "optional manual editing boundaries: closed [start, end] "
+            "zero-based word-index intervals (each spanning at least two "
+            "words) that no subtitle boundary may fall inside; intervals "
+            "must not overlap one another and must not contain a "
+            "required_break_after index"
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_limits(self) -> "SegmentRequest":
